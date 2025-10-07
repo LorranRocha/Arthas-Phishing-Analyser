@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Email Phishing Analyzer CLI Tool
-Analyzes .eml files for phishing indicators including:
+Analyzes .eml files searching for phishing indicators such as:
 - Suspicious links (VirusTotal check)
 - Sender spoofing (envelope vs header comparison)
-- Domain age analysis
+- Domain age
 - Header inconsistencies
 """
 
@@ -15,16 +15,13 @@ from email.header import decode_header
 import requests
 import hashlib
 import os
-import socket
 import whois
 from datetime import datetime
-from dotenv import load_dotenv
-from urllib.parse import urlparse
 import sys
+from bs4 import BeautifulSoup
 
-# Configuration
-load_dotenv()
-VIRUSTOTAL_API_KEY = os.getenv("VIRUSTOTAL_API_KEY")
+# Config
+VIRUSTOTAL_API_KEY = "<apikeyhere>"
 HEADER_ANALYSIS_RULES = {
     'spf_fail': {'pattern': r'SPF=(fail|softfail)', 'message': 'SPF validation failed', 'invert': False},
     'missing_dkim': {'pattern': r'DKIM-Signature:', 'message': 'Missing DKIM signature', 'invert': True},
@@ -32,13 +29,11 @@ HEADER_ANALYSIS_RULES = {
 }
 
 def get_envelope_sender(msg):
-    """Extracts actual sender from email envelope"""
-    # 1. Check Return-Path first
+    """Extract real sender from email envelope"""
     return_path = msg.get('Return-Path', '')
     if return_path:
         return return_path.strip('<>')
 
-    # 2. Parse Received headers as fallback
     received_headers = msg.get_all('Received', [])
     if received_headers:
         first_received = received_headers[0]
@@ -49,15 +44,14 @@ def get_envelope_sender(msg):
     return None
 
 def extract_domain(email_address):
-    """Extracts domain from email address"""
+    """Extract domain from email address"""
     if not email_address or '@' not in email_address:
         return None
     domain_part = email_address.split('@')[-1].lower().strip('>')
-    # Clean domain by removing any % signs and other special characters
     return re.sub(r'[^a-z0-9.-]', '', domain_part)
 
 def check_domain_age(domain):
-    """Checks domain registration age using WHOIS"""
+    """Check domain age using WHOIS"""
     if not domain:
         return None
     try:
@@ -74,7 +68,7 @@ def check_domain_age(domain):
     return None
 
 def check_virustotal(url):
-    """Checks URL reputation with VirusTotal"""
+    """Check URL reputation via VirusTotal"""
     if not VIRUSTOTAL_API_KEY:
         return False
 
@@ -96,7 +90,7 @@ def check_virustotal(url):
     return False
 
 def analyze_headers(headers):
-    """Checks for suspicious email headers"""
+    """Check for suspicious headers"""
     findings = []
     headers_str = '\n'.join(f"{k}: {v}" for k, v in headers.items())
 
@@ -108,26 +102,43 @@ def analyze_headers(headers):
     return findings
 
 def parse_eml(file_path):
-    """Parses .eml file and extracts key components"""
+    """Parse .eml and extract key components"""
     with open(file_path, 'rb') as f:
-        msg = email.message_from_binary_file(f, policy=email.policy.default)
+        try:
+            msg = email.message_from_binary_file(f, policy=email.policy.default)
+        except ValueError as e:
+            print(f"[!] Warning: Failed to parse with default policy: {e}")
+            print("[!] Falling back to compat32 policy...")
+            f.seek(0)  # Rewind file pointer
+            msg = email.message_from_binary_file(f, policy=email.policy.compat32)
 
-    # Extract basic info
+
     sender = msg.get('From', '')
     subject = decode_header(msg.get('Subject', ''))[0][0]
     if isinstance(subject, bytes):
         subject = subject.decode(errors='ignore')
-    
-    # Extract links from all parts
+
     links = set()
     body = ""
-    
-    for part in msg.walk():
-        if part.get_content_type() == 'text/plain':
-            body += part.get_payload(decode=True).decode(errors='ignore')
 
-    url_pattern = r'(?:(?:https?|ftp)://|www\.)[^\s<>"]+?(?=(?:[\s<>"]|$))'
-    links.update(re.findall(url_pattern, body, re.IGNORECASE))
+    for part in msg.walk():
+        content_type = part.get_content_type()
+        payload = part.get_payload(decode=True)
+        if payload:
+            content = payload.decode(errors='ignore')
+            if content_type == 'text/plain':
+                body += content
+                # Extract links from plain text with regex
+                url_pattern = r'(?:(?:https?|ftp)://|www\.)[^\s<>"]+'
+                links.update(re.findall(url_pattern, content, re.IGNORECASE))
+            elif content_type == 'text/html':
+                # Extract links from HTML with BeautifulSoup
+                soup = BeautifulSoup(content, 'html.parser')
+                for tag in soup.find_all('a', href=True):
+                    href = tag['href']
+                    links.add(href)
+                # Add visible text for possible secondary analysis
+                body += soup.get_text(separator=' ', strip=True)
 
     return {
         'sender': sender,
@@ -135,19 +146,57 @@ def parse_eml(file_path):
         'subject': subject,
         'links': list(links),
         'headers': dict(msg.items()),
-        'body': body
+        'body': body,
+        'msg_obj': msg  # Added to pass original email message object for IP extraction
     }
 
+# NEW - Extract sender IP from Received headers
+def get_sender_ip(msg):
+    """Extract originating IP from Received headers"""
+    received_headers = msg.get_all('Received', [])
+    if not received_headers:
+        return None
+
+    for header in reversed(received_headers):
+        ip_match = re.search(r'\b(\d{1,3}(?:\.\d{1,3}){3})\b', header)
+        if ip_match:
+            ip = ip_match.group(1)
+            octets = ip.split('.')
+            if all(0 <= int(octet) <= 255 for octet in octets):
+                return ip
+    return None
+
+# NEW - Check IP reputation in VirusTotal
+def check_ip_virustotal(ip):
+    """Check IP reputation via VirusTotal"""
+    if not VIRUSTOTAL_API_KEY:
+        return False
+
+    headers = {'x-apikey': VIRUSTOTAL_API_KEY}
+
+    try:
+        response = requests.get(
+            f'https://www.virustotal.com/api/v3/ip_addresses/{ip}',
+            headers=headers,
+            timeout=10
+        )
+        if response.status_code == 200:
+            result = response.json()
+            return result['data']['attributes']['last_analysis_stats']['malicious'] > 0
+    except requests.RequestException:
+        pass
+    return False
+
 def analyze_email(file_path):
-    """Runs complete email analysis"""
+    """Run full email analysis"""
     data = parse_eml(file_path)
-    
+    msg_obj = data.get('msg_obj')
+
     print(f"\n📧 Email Analysis: {file_path}")
     print(f"📌 Subject: {data['subject']}")
     print(f"👤 From: {data['sender']}")
     print(f"📮 Envelope From: {data['envelope_sender'] or 'Not available'}")
 
-    # Sender analysis
     from_domain = extract_domain(data['sender'])
     envelope_domain = extract_domain(data['envelope_sender'])
 
@@ -166,14 +215,12 @@ def analyze_email(file_path):
         else:
             print(f"⚠️ Could not verify domain age for '{from_domain}'")
 
-    # Header analysis
     header_findings = analyze_headers(data['headers'])
     if header_findings:
         print("\n🔍 Header Analysis:")
         for finding in header_findings:
             print(f"  - {finding}")
 
-    # Link analysis
     malicious_links = []
     if data['links']:
         print("\n🔗 Found Links:")
@@ -184,7 +231,17 @@ def analyze_email(file_path):
             else:
                 print(f"  - ✓ Clean: {link}")
 
-    # Summary
+    # NEW - Extract and analyze sender IP
+    sender_ip = get_sender_ip(msg_obj)
+    if sender_ip:
+        print(f"\n🌐 Sender IP detected: {sender_ip}")
+        if check_ip_virustotal(sender_ip):
+            print(f"🚨 ALERT: Sender IP {sender_ip} is flagged as malicious on VirusTotal")
+        else:
+            print(f"✓ Sender IP {sender_ip} appears clean according to VirusTotal")
+    else:
+        print("\n🌐 Sender IP not found in Received headers")
+
     print("\n📊 Summary:")
     print(f"  - Total links: {len(data['links'])}")
     print(f"  - Malicious links: {len(malicious_links)}")
